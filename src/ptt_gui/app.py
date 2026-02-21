@@ -154,6 +154,42 @@ window, .main-window {
     background: rgba(166,227,161,0.15);
 }
 
+.rec-more-btn {
+    border-radius: 6px;
+    padding: 2px 8px;
+    color: #f38ba8;
+    border: 1px solid #f38ba8;
+    font-size: 11px;
+    background: transparent;
+}
+
+.rec-more-btn:hover {
+    background: rgba(243,139,168,0.15);
+}
+
+.rec-more-btn.active {
+    background: rgba(243,139,168,0.3);
+    font-weight: bold;
+}
+
+.history-textview {
+    background-color: transparent;
+    color: #cdd6f4;
+    font-size: 14px;
+    padding: 4px;
+    caret-color: #89b4fa;
+}
+
+.history-textview text {
+    background-color: transparent;
+    color: #cdd6f4;
+}
+
+.history-textview text selection {
+    background-color: rgba(137,180,250,0.3);
+    color: #cdd6f4;
+}
+
 .sidebar-title {
     color: #cdd6f4;
     font-weight: 700;
@@ -319,39 +355,86 @@ class WaveformWidget(Gtk.Box):
 # ---------------------------------------------------------------------------
 
 class HistoryRow(Gtk.Box):
-    def __init__(self, text: str, timestamp: str, on_copy, on_type) -> None:
+    """Editable history entry with Copy, Type, and Record-more buttons."""
+
+    def __init__(self, text: str, timestamp: str, on_copy, on_type, on_rec_more) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.add_css_class("history-row")
         self.set_margin_top(2)
         self.set_margin_bottom(2)
         self.set_margin_start(4)
         self.set_margin_end(4)
+        self._on_copy = on_copy
+        self._on_type = on_type
+        self._on_rec_more = on_rec_more
 
-        # Top row: text + buttons
-        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        # Editable text area
+        self._textview = Gtk.TextView()
+        self._textview.add_css_class("history-textview")
+        self._textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self._textview.set_editable(True)
+        self._textview.set_cursor_visible(True)
+        self._textview.set_hexpand(True)
+        self._textview.set_vexpand(False)
+        self._textview.set_accepts_tab(False)
+        self._textview.get_buffer().set_text(text)
 
-        label = Gtk.Label(label=text, xalign=0.0, wrap=True, wrap_mode=2)
-        label.add_css_class("history-text")
-        label.set_hexpand(True)
-        label.set_selectable(True)
-        top.append(label)
+        # Auto-resize: limit height but allow scroll
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_child(self._textview)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_max_content_height(120)
+        scroll.set_propagate_natural_height(True)
+        self.append(scroll)
 
-        btn_copy = Gtk.Button(label="Copy")
-        btn_copy.add_css_class("copy-btn")
-        btn_copy.connect("clicked", lambda _: on_copy(text))
-        top.append(btn_copy)
+        # Button row
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_row.set_margin_top(2)
 
-        btn_type = Gtk.Button(label="Type")
-        btn_type.add_css_class("type-btn")
-        btn_type.connect("clicked", lambda _: on_type(text))
-        top.append(btn_type)
-
-        self.append(top)
-
-        # Bottom: timestamp
+        # Timestamp
         time_label = Gtk.Label(label=timestamp, xalign=0.0)
         time_label.add_css_class("history-time")
-        self.append(time_label)
+        time_label.set_hexpand(True)
+        btn_row.append(time_label)
+
+        # Record more button
+        self._btn_rec = Gtk.Button(label="+Nagraj")
+        self._btn_rec.add_css_class("rec-more-btn")
+        self._btn_rec.set_tooltip_text("Dograj do tego tekstu")
+        self._btn_rec.connect("clicked", self._on_rec_click)
+        btn_row.append(self._btn_rec)
+
+        # Copy button
+        btn_copy = Gtk.Button(label="Copy")
+        btn_copy.add_css_class("copy-btn")
+        btn_copy.connect("clicked", self._on_copy_click)
+        btn_row.append(btn_copy)
+
+        # Type button
+        btn_type = Gtk.Button(label="Type")
+        btn_type.add_css_class("type-btn")
+        btn_type.connect("clicked", self._on_type_click)
+        btn_row.append(btn_type)
+
+        self.append(btn_row)
+
+    def get_text(self) -> str:
+        buf = self._textview.get_buffer()
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+    def append_text(self, new_text: str) -> None:
+        buf = self._textview.get_buffer()
+        end = buf.get_end_iter()
+        buf.insert(end, " " + new_text)
+
+    def _on_copy_click(self, _btn) -> None:
+        self._on_copy(self.get_text())
+
+    def _on_type_click(self, _btn) -> None:
+        self._on_type(self.get_text())
+
+    def _on_rec_click(self, _btn) -> None:
+        self._on_rec_more(self)
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +578,7 @@ class PTTWindow(Adw.ApplicationWindow):
         self._recorder = Recorder(on_chunk=self._on_audio_chunk)
         self._recording: bool = False
         self._history_items: list[str] = []
+        self._append_target: Optional["HistoryRow"] = None  # row to append to
 
         # --- CSS ---
         css_provider = Gtk.CssProvider()
@@ -800,22 +884,36 @@ class PTTWindow(Adw.ApplicationWindow):
             GLib.idle_add(self._on_transcription_error, str(exc))
 
     def _on_transcription_done(self, text: str) -> None:
-        print(f"[DBG] _on_transcription_done: text='{text}', auto_type={self.auto_type}")
+        print(f"[DBG] _on_transcription_done: text='{text}', append={self._append_target is not None}")
         self._reset_to_ready()
-        if text:
+
+        if not text:
+            self._append_target = None
+            self._show_toast("Nie rozpoznano mowy")
+            return GLib.SOURCE_REMOVE
+
+        # Append mode: add text to existing history row
+        if self._append_target is not None:
+            row = self._append_target
+            self._append_target = None
+            row.append_text(text)
+            row._btn_rec.remove_css_class("active")
+            full_text = row.get_text()
+            clipboard = Gdk.Display.get_default().get_clipboard()
+            clipboard.set(full_text)
+            self._show_toast("Dopisano do wpisu")
+        else:
+            # Normal mode: create new history entry
             self._add_to_history(text)
-            # Always copy to GTK clipboard so the result is always accessible
             clipboard = Gdk.Display.get_default().get_clipboard()
             clipboard.set(text)
             if self.auto_type:
-                # Short delay so the PTT window can lose focus before wtype fires
                 threading.Thread(
                     target=self._wtype_with_delay, args=(text,), daemon=True
                 ).start()
             else:
                 self._show_toast("Skopiowano do schowka")
-        else:
-            self._show_toast("Nie rozpoznano mowy")
+
         return GLib.SOURCE_REMOVE
 
     def _wtype_with_delay(self, text: str) -> None:
@@ -852,15 +950,16 @@ class PTTWindow(Adw.ApplicationWindow):
     # History management
     # ======================================================================
 
-    def _add_to_history(self, text: str) -> None:
+    def _add_to_history(self, text: str) -> "HistoryRow":
         # Remove empty state label
         if self._empty_label.get_parent() is not None:
             self._history_box.remove(self._empty_label)
 
         ts = datetime.now().strftime("%H:%M:%S")
-        row = HistoryRow(text, ts, self._copy_text, self._type_text)
+        row = HistoryRow(text, ts, self._copy_text, self._type_text, self._rec_more)
         self._history_box.prepend(row)
         self._history_items.insert(0, text)
+        return row
 
         # Trim excess
         children = []
@@ -896,6 +995,14 @@ class PTTWindow(Adw.ApplicationWindow):
         if not ok:
             GLib.idle_add(self._show_toast, "Błąd wtype — czy wtype jest zainstalowany?")
             return GLib.SOURCE_REMOVE
+
+    def _rec_more(self, row: "HistoryRow") -> None:
+        """Start recording to append text to an existing history row."""
+        if self._recording:
+            return
+        self._append_target = row
+        row._btn_rec.add_css_class("active")
+        self._start_recording()
 
     # ======================================================================
     # Status helpers
