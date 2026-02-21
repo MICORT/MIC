@@ -12,4 +12,8 @@ source "${VENV}/bin/activate"
 # Make the ptt_gui package importable without a pip install
 export PYTHONPATH="${SRC_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
+# Ensure UTF-8 locale for Polish characters
+export LANG="${LANG:-C.UTF-8}"
+export PYTHONIOENCODING=utf-8
+
 exec python3 -m ptt_gui.app "$@"

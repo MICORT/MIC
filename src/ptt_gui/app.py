@@ -206,6 +206,52 @@ headerbar {
 .wf-bar-high {
     background-color: #a6e3a1;
 }
+
+/* Mini mode */
+.mini-window {
+    background-color: #1e1e2e;
+    border-radius: 16px;
+}
+
+.mini-mic-btn {
+    border-radius: 50px;
+    min-width: 64px;
+    min-height: 64px;
+    background: linear-gradient(135deg, #313244, #45475a);
+    color: #cdd6f4;
+    border: 2px solid #45475a;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    transition: all 150ms ease;
+}
+
+.mini-mic-btn:hover {
+    border-color: #89b4fa;
+    box-shadow: 0 4px 20px rgba(137,180,250,0.3);
+}
+
+.mini-mic-btn.recording {
+    background: linear-gradient(135deg, #f38ba8, #e64553);
+    border-color: #f38ba8;
+}
+
+.mini-mic-btn.transcribing {
+    background: linear-gradient(135deg, #fab387, #e5a066);
+    border-color: #fab387;
+}
+
+.mini-status {
+    color: #6c7086;
+    font-size: 10px;
+    font-weight: 500;
+}
+
+.mini-status.recording {
+    color: #f38ba8;
+}
+
+.mini-status.ready {
+    color: #a6e3a1;
+}
 """
 
 
@@ -487,6 +533,12 @@ class PTTWindow(Adw.ApplicationWindow):
         title_widget = Adw.WindowTitle(title=APP_NAME, subtitle="Naciśnij i przytrzymaj mikrofon")
         header.set_title_widget(title_widget)
 
+        # Mini mode button
+        mini_btn = Gtk.Button(icon_name="view-pin-symbolic")
+        mini_btn.set_tooltip_text("Tryb mini")
+        mini_btn.connect("clicked", self._on_mini_mode)
+        header.pack_start(mini_btn)
+
         # Settings button
         settings_btn = Gtk.Button(icon_name="preferences-system-symbolic")
         settings_btn.set_tooltip_text("Ustawienia")
@@ -546,18 +598,14 @@ class PTTWindow(Adw.ApplicationWindow):
         mic_icon.set_pixel_size(64)
         mic_inner.append(mic_icon)
 
-        self._mic_label = Gtk.Label(label="Mów")
+        self._mic_label = Gtk.Label(label="START")
         mic_inner.append(self._mic_label)
 
         self._mic_btn.set_child(mic_inner)
         self._mic_btn.set_halign(Gtk.Align.CENTER)
 
-        # Press/release gesture for hold-to-record
-        gesture = Gtk.GestureClick()
-        gesture.set_button(0)   # all buttons
-        gesture.connect("pressed", self._on_mic_press)
-        gesture.connect("released", self._on_mic_release)
-        self._mic_btn.add_controller(gesture)
+        # Toggle click: click = start recording, click again = stop
+        self._mic_btn.connect("clicked", self._on_mic_toggle)
 
         box.append(self._mic_btn)
 
@@ -596,7 +644,7 @@ class PTTWindow(Adw.ApplicationWindow):
         box.append(mode_box)
 
         # --- Hint ---
-        hint = Gtk.Label(label="Przytrzymaj mikrofon lub [Space] aby nagrać")
+        hint = Gtk.Label(label="Kliknij mikrofon lub [Space] aby nagrać/zatrzymać")
         hint.add_css_class("hint-label")
         box.append(hint)
 
@@ -667,6 +715,7 @@ class PTTWindow(Adw.ApplicationWindow):
             GLib.idle_add(self._on_model_error, str(exc))
 
     def _on_model_loaded(self, model) -> None:
+        print(f"[DBG] Model loaded: {model}")
         self._model = model
         self._model_loading = False
         self._mic_btn.set_sensitive(True)
@@ -690,12 +739,14 @@ class PTTWindow(Adw.ApplicationWindow):
 
     def _start_recording(self) -> None:
         if self._recording or self._model is None:
+            print(f"[DBG] _start_recording blocked: recording={self._recording}, model={self._model is not None}")
             return
+        print("[DBG] _start_recording OK")
         self._recording = True
         self._waveform.set_active(True)
         self._mic_btn.add_css_class("recording")
         self._set_status("NAGRYWANIE...", "recording")
-        self._mic_label.set_label("Puść")
+        self._mic_label.set_label("STOP")
         # Open the PortAudio stream in a thread to avoid blocking the GTK loop
         threading.Thread(target=self._recorder.start, daemon=True).start()
 
@@ -706,17 +757,28 @@ class PTTWindow(Adw.ApplicationWindow):
         audio = self._recorder.stop()
         self._waveform.set_active(False)
         self._mic_btn.remove_css_class("recording")
-        self._set_status("PRZETWARZANIE...", "transcribing")
-        self._mic_btn.add_css_class("transcribing")
-        self._mic_label.set_label("Mów")
-        self._spinner.set_visible(True)
-        self._spinner.start()
 
         duration = len(audio) / 16000
+        rms_val = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2))) if len(audio) > 0 else 0
+        print(f"[DBG] _stop_recording: duration={duration:.2f}s, rms={rms_val:.1f}")
+
         if duration < self.min_duration:
             self._reset_to_ready()
-            self._show_toast(f"Za krótkie nagranie ({duration:.1f}s)")
+            self._show_toast(f"Za krótkie ({duration:.1f}s)")
             return
+
+        # Skip silence — if RMS < 100, there's no speech
+        if rms_val < 100:
+            self._reset_to_ready()
+            self._show_toast("Cisza — nie wykryto mowy")
+            print(f"[DBG] Skipped: silence (rms={rms_val:.1f})")
+            return
+
+        self._set_status("PRZETWARZANIE...", "transcribing")
+        self._mic_btn.add_css_class("transcribing")
+        self._mic_label.set_label("...")
+        self._spinner.set_visible(True)
+        self._spinner.start()
 
         # Transcribe in background thread
         model_ref = self._model
@@ -727,12 +789,18 @@ class PTTWindow(Adw.ApplicationWindow):
 
     def _transcribe_worker(self, model, audio: "np.ndarray") -> None:
         try:
+            print(f"[DBG] transcribe_worker: starting ({len(audio)/16000:.1f}s audio)")
+            t0 = time.monotonic()
             text = transcribe(model, audio)
+            elapsed = time.monotonic() - t0
+            print(f"[DBG] transcribe_worker: done in {elapsed:.1f}s, text='{text}'")
             GLib.idle_add(self._on_transcription_done, text)
         except Exception as exc:
+            print(f"[DBG] transcribe_worker ERROR: {exc}")
             GLib.idle_add(self._on_transcription_error, str(exc))
 
     def _on_transcription_done(self, text: str) -> None:
+        print(f"[DBG] _on_transcription_done: text='{text}', auto_type={self.auto_type}")
         self._reset_to_ready()
         if text:
             self._add_to_history(text)
@@ -753,7 +821,9 @@ class PTTWindow(Adw.ApplicationWindow):
     def _wtype_with_delay(self, text: str) -> None:
         """Wait briefly so the PTT window loses focus, then type via wtype."""
         time.sleep(0.25)
+        print(f"[DBG] _wtype_with_delay: calling wtype with '{text}'")
         ok = wtype_text(text)
+        print(f"[DBG] wtype result: {ok}")
         if not ok:
             GLib.idle_add(self._show_toast, "Błąd wtype — skopiowano do schowka")
 
@@ -768,7 +838,7 @@ class PTTWindow(Adw.ApplicationWindow):
         self._spinner.stop()
         self._spinner.set_visible(False)
         self._set_status("GOTOWY", "ready")
-        self._mic_label.set_label("Mów")
+        self._mic_label.set_label("START")
 
     # ======================================================================
     # Audio chunk callback (audio thread)
@@ -855,21 +925,29 @@ class PTTWindow(Adw.ApplicationWindow):
     # Event handlers
     # ======================================================================
 
-    def _on_mic_press(self, gesture, n_press, x, y) -> None:
-        self._start_recording()
+    def _auto_stop(self) -> bool:
+        if self._recording:
+            print("[DBG] Auto-stop after 30s")
+            self._stop_recording()
+        return GLib.SOURCE_REMOVE
 
-    def _on_mic_release(self, gesture, n_press, x, y) -> None:
-        self._stop_recording()
+    def _on_mic_toggle(self, _btn) -> None:
+        if self._recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
 
     def _on_key_pressed(self, ctrl, keyval, keycode, state) -> bool:
-        if keyval == Gdk.KEY_space and not self._recording:
-            self._start_recording()
+        if keyval == Gdk.KEY_space:
+            if self._recording:
+                self._stop_recording()
+            else:
+                self._start_recording()
             return True
         return False
 
     def _on_key_released(self, ctrl, keyval, keycode, state) -> None:
-        if keyval == Gdk.KEY_space and self._recording:
-            self._stop_recording()
+        pass  # toggle mode — all handled in key-pressed
 
     def _on_auto_type_toggle(self, switch, state) -> bool:
         self.auto_type = state
@@ -879,6 +957,128 @@ class PTTWindow(Adw.ApplicationWindow):
         dialog = SettingsDialog(self)
         dialog.present(self)
 
+    def _on_mini_mode(self, _btn) -> None:
+        """Switch to mini floating window."""
+        app = self.get_application()
+        if app:
+            mini = MiniWindow(app, self)
+            mini.present()
+            self.set_visible(False)
+
+
+# ---------------------------------------------------------------------------
+# Mini floating window
+# ---------------------------------------------------------------------------
+
+class MiniWindow(Gtk.Window):
+    """Tiny always-on-top window with just a mic button and status dot."""
+
+    def __init__(self, app: Adw.Application, main_win: PTTWindow) -> None:
+        super().__init__(application=app)
+        self._main_win = main_win
+        self.set_title("MIC")
+        self.set_default_size(96, 120)
+        self.set_resizable(False)
+        self.set_decorated(False)  # no title bar — frameless
+        self.add_css_class("mini-window")
+
+        # Keep on top
+        self.set_deletable(True)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(12)
+        box.set_margin_bottom(8)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_halign(Gtk.Align.CENTER)
+
+        # Mic button
+        self._mic_btn = Gtk.Button()
+        self._mic_btn.add_css_class("mini-mic-btn")
+        mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
+        mic_icon.set_pixel_size(32)
+        self._mic_btn.set_child(mic_icon)
+        self._mic_btn.connect("clicked", self._on_toggle)
+        box.append(self._mic_btn)
+
+        # Status label
+        self._status = Gtk.Label(label="Ready")
+        self._status.add_css_class("mini-status")
+        self._status.add_css_class("ready")
+        box.append(self._status)
+
+        # Expand button — back to full window
+        expand_btn = Gtk.Button(icon_name="view-fullscreen-symbolic")
+        expand_btn.set_tooltip_text("Pełne okno")
+        expand_btn.add_css_class("flat")
+        expand_btn.connect("clicked", self._on_expand)
+        box.append(expand_btn)
+
+        self.set_child(box)
+
+        # Keyboard shortcut: Space = toggle
+        key_ctrl = Gtk.EventControllerKey()
+        key_ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(key_ctrl)
+
+        # Monitor main window state changes
+        self._poll_id = GLib.timeout_add(200, self._poll_state)
+
+        self.connect("close-request", self._on_close)
+
+    def _on_toggle(self, _btn) -> None:
+        if self._main_win._recording:
+            self._main_win._stop_recording()
+        else:
+            self._main_win._start_recording()
+
+    def _on_key(self, ctrl, keyval, keycode, state) -> bool:
+        if keyval == Gdk.KEY_space:
+            self._on_toggle(None)
+            return True
+        return False
+
+    def _poll_state(self) -> bool:
+        """Sync mini UI with main window recording state."""
+        if not self.get_visible():
+            return GLib.SOURCE_REMOVE
+
+        if self._main_win._recording:
+            self._mic_btn.add_css_class("recording")
+            self._mic_btn.remove_css_class("transcribing")
+            self._set_mini_status("REC", "recording")
+        elif self._main_win._model_loading:
+            self._set_mini_status("...", "")
+        elif self._main_win._spinner.get_visible():
+            self._mic_btn.remove_css_class("recording")
+            self._mic_btn.add_css_class("transcribing")
+            self._set_mini_status("...", "")
+        else:
+            self._mic_btn.remove_css_class("recording")
+            self._mic_btn.remove_css_class("transcribing")
+            self._set_mini_status("Ready", "ready")
+
+        return GLib.SOURCE_CONTINUE
+
+    def _set_mini_status(self, text: str, css: str) -> None:
+        self._status.set_label(text)
+        for cls in ("ready", "recording"):
+            self._status.remove_css_class(cls)
+        if css:
+            self._status.add_css_class(css)
+
+    def _on_expand(self, _btn) -> None:
+        self._main_win.set_visible(True)
+        self._main_win.present()
+        self.close()
+
+    def _on_close(self, _win) -> None:
+        if self._poll_id:
+            GLib.source_remove(self._poll_id)
+            self._poll_id = 0
+        self._main_win.set_visible(True)
+        self._main_win.present()
+        return False
 
 
 # ---------------------------------------------------------------------------

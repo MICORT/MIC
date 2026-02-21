@@ -128,17 +128,34 @@ def transcribe(model: WhisperModel, audio_data: np.ndarray) -> str:
 # ---------------------------------------------------------------------------
 
 def wtype_text(text: str) -> bool:
-    """Type *text* into the previously active window via wtype.
+    """Type *text* into the previously active window.
 
+    Strategy: copy to X11 clipboard via xclip, then simulate Ctrl+V via xdotool.
+    Falls back to wtype if xdotool is unavailable.
     Returns True on success, False on failure.
     """
+    # Method 1: xclip + xdotool (works on GNOME Wayland with XWayland)
+    try:
+        subprocess.run(
+            ["xclip", "-selection", "clipboard"],
+            input=text.encode("utf-8"), check=True, timeout=3,
+        )
+        subprocess.run(
+            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+            check=True, timeout=3,
+        )
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+
+    # Method 2: wtype (native Wayland — may not work on all compositors)
     try:
         subprocess.run(["wtype", "--", text], check=True, timeout=5)
         return True
-    except FileNotFoundError:
-        return False
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return False
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+
+    return False
 
 
 def copy_to_clipboard_xdg(text: str) -> bool:
