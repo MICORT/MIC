@@ -12,7 +12,6 @@ Architecture
 
 from __future__ import annotations
 
-import math
 import os
 import sys
 import threading
@@ -227,7 +226,6 @@ class WaveformWidget(Gtk.Box):
         self._levels: list[float] = [0.0] * WAVEFORM_BARS
         self._bars: list[Gtk.Box] = []
         self._active: bool = False
-        self._phase: float = 0.0
 
         for _ in range(WAVEFORM_BARS):
             bar = Gtk.Box()
@@ -249,9 +247,6 @@ class WaveformWidget(Gtk.Box):
             self._levels = [0.0] * WAVEFORM_BARS
         GLib.idle_add(self._update_bars)
 
-    def queue_draw(self) -> None:
-        self._update_bars()
-
     def _update_bars(self) -> None:
         if self._active:
             for i, bar in enumerate(self._bars):
@@ -264,11 +259,9 @@ class WaveformWidget(Gtk.Box):
                 else:
                     bar.remove_css_class("wf-bar-high")
         else:
-            self._phase += 0.08
-            for i, bar in enumerate(self._bars):
-                lvl = (math.sin(self._phase + i * 0.4) + 1) / 2 * 0.12
-                h = max(2, int(lvl * 72))
-                bar.set_size_request(4, h)
+            # Static idle state — flat bars, no animation
+            for bar in self._bars:
+                bar.set_size_request(4, 3)
                 bar.add_css_class("wf-bar-idle")
                 bar.remove_css_class("wf-bar-high")
         return GLib.SOURCE_REMOVE
@@ -357,7 +350,7 @@ class SettingsDialog(Adw.Dialog):
         self._mode_row = Adw.ComboRow(title="Co zrobić z tekstem")
         mode_model = Gtk.StringList.new(["Tylko historia (clipboard)", "Wpisz w aktywne okno (wtype)"])
         self._mode_row.set_model(mode_model)
-        self._mode_row.set_selected(1 if parent.auto_type else 0)
+        self._mode_row.set_selected(1 if parent.auto_type else 0)  # reflects current state
         self._mode_row.connect("notify::selected", self._on_mode_changed)
         mode_group.add(self._mode_row)
         content.append(mode_group)
@@ -432,14 +425,13 @@ class PTTWindow(Adw.ApplicationWindow):
 
         # --- State ---
         self.model_path: str = DEFAULT_MODEL_PATH
-        self.auto_type: bool = False
+        self.auto_type: bool = True
         self.gain: float = 1.0
         self.min_duration: float = 0.3
         self._model: Optional[object] = None
         self._model_loading: bool = False
         self._recorder = Recorder(on_chunk=self._on_audio_chunk)
         self._recording: bool = False
-        self._idle_timer: Optional[int] = None
         self._history_items: list[str] = []
 
         # --- CSS ---
@@ -457,8 +449,7 @@ class PTTWindow(Adw.ApplicationWindow):
         # --- Load model in background ---
         self._load_model_async()
 
-        # --- Idle waveform animation ---
-        self._idle_timer = GLib.timeout_add(60, self._tick_idle)
+        # No idle animation — waveform only updates when recording
 
         # --- Keyboard shortcut: Space = push-to-talk ---
         key_ctrl = Gtk.EventControllerKey()
@@ -578,7 +569,7 @@ class PTTWindow(Adw.ApplicationWindow):
         mode_box.append(mode_label)
 
         self._auto_type_switch = Gtk.Switch()
-        self._auto_type_switch.set_active(False)
+        self._auto_type_switch.set_active(True)
         self._auto_type_switch.connect("state-set", self._on_auto_type_toggle)
         mode_box.append(self._auto_type_switch)
 
@@ -689,7 +680,8 @@ class PTTWindow(Adw.ApplicationWindow):
         self._mic_btn.add_css_class("recording")
         self._set_status("NAGRYWANIE...", "recording")
         self._mic_label.set_label("Puść")
-        self._recorder.start()
+        # Open the PortAudio stream in a thread to avoid blocking the GTK loop
+        threading.Thread(target=self._recorder.start, daemon=True).start()
 
     def _stop_recording(self) -> None:
         if not self._recording:
@@ -728,11 +720,26 @@ class PTTWindow(Adw.ApplicationWindow):
         self._reset_to_ready()
         if text:
             self._add_to_history(text)
+            # Always copy to GTK clipboard so the result is always accessible
+            clipboard = Gdk.Display.get_default().get_clipboard()
+            clipboard.set(text)
             if self.auto_type:
-                threading.Thread(target=wtype_text, args=(text,), daemon=True).start()
+                # Short delay so the PTT window can lose focus before wtype fires
+                threading.Thread(
+                    target=self._wtype_with_delay, args=(text,), daemon=True
+                ).start()
+            else:
+                self._show_toast("Skopiowano do schowka")
         else:
             self._show_toast("Nie rozpoznano mowy")
         return GLib.SOURCE_REMOVE
+
+    def _wtype_with_delay(self, text: str) -> None:
+        """Wait briefly so the PTT window loses focus, then type via wtype."""
+        time.sleep(0.25)
+        ok = wtype_text(text)
+        if not ok:
+            GLib.idle_add(self._show_toast, "Błąd wtype — skopiowano do schowka")
 
     def _on_transcription_error(self, msg: str) -> None:
         self._reset_to_ready()
@@ -856,14 +863,6 @@ class PTTWindow(Adw.ApplicationWindow):
         dialog = SettingsDialog(self)
         dialog.present(self)
 
-    # ======================================================================
-    # Idle waveform tick
-    # ======================================================================
-
-    def _tick_idle(self) -> bool:
-        if not self._recording:
-            self._waveform.queue_draw()
-        return GLib.SOURCE_CONTINUE
 
 
 # ---------------------------------------------------------------------------

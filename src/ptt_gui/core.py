@@ -10,6 +10,7 @@ import io
 import json
 import os
 import subprocess
+import threading
 import wave
 from typing import Callable, Optional
 
@@ -120,6 +121,9 @@ class Recorder:
         self._recording: bool = False
         self._stream: Optional[sd.InputStream] = None
         self._on_chunk = on_chunk
+        self._lock = threading.Lock()
+        # Event set once the stream is fully opened — stop() waits on this
+        self._stream_ready = threading.Event()
 
     # ------------------------------------------------------------------
     # Public API
@@ -130,33 +134,48 @@ class Recorder:
         return self._recording
 
     def start(self, device: Optional[int] = None, samplerate: int = SAMPLE_RATE) -> None:
-        """Start recording.  Safe to call multiple times (stops previous)."""
+        """Start recording.  Safe to call multiple times (stops previous).
+
+        May be called from a background thread.  Sets _stream_ready when the
+        PortAudio stream is open so that stop() can safely close it.
+        """
         self.stop()
-        self._frames = []
-        self._recording = True
-        self._stream = sd.InputStream(
-            samplerate=samplerate,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=BLOCK_SIZE,
-            device=device,
-            callback=self._callback,
-        )
-        self._stream.start()
+        with self._lock:
+            self._frames = []
+            self._recording = True
+            self._stream_ready.clear()
+            self._stream = sd.InputStream(
+                samplerate=samplerate,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=BLOCK_SIZE,
+                device=device,
+                callback=self._callback,
+            )
+            self._stream.start()
+            self._stream_ready.set()
 
     def stop(self) -> np.ndarray:
-        """Stop recording and return the captured audio as int16 mono array."""
+        """Stop recording and return the captured audio as int16 mono array.
+
+        Waits (briefly) for the stream to be ready before closing, so it is
+        safe to call immediately after start() even from another thread.
+        """
         self._recording = False
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            finally:
-                self._stream = None
-        if self._frames:
-            return np.concatenate(self._frames, axis=0).flatten()
+        # Wait at most 2 s for the stream to be opened before attempting close
+        self._stream_ready.wait(timeout=2.0)
+        with self._lock:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                finally:
+                    self._stream = None
+            frames = list(self._frames)
+        if frames:
+            return np.concatenate(frames, axis=0).flatten()
         return np.array([], dtype=np.int16)
 
     # ------------------------------------------------------------------
