@@ -2,67 +2,125 @@
 ptt_gui.core — Shared audio recording and transcription logic.
 
 Used by both the CLI (ptt.py) and the GTK4 GUI (ptt_app.py).
+
+Speech recognition uses faster-whisper (CTranslate2 backend, no PyTorch).
+Model: whisper base, language: Polish (pl).
 """
 
 from __future__ import annotations
 
 import io
-import json
 import os
 import subprocess
+import tempfile
 import threading
 import wave
 from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
-import vosk
+from faster_whisper import WhisperModel
 
 SAMPLE_RATE: int = 16000
 CHANNELS: int = 1
 BLOCK_SIZE: int = 1024
-DEFAULT_MODEL_PATH: str = os.path.expanduser("~/stt-models/polish")
+
+# Default whisper model size — "base" is a good speed/quality balance for CPU
+DEFAULT_WHISPER_MODEL: str = "base"
+# Language hint for Whisper — speeds up recognition and improves accuracy
+DEFAULT_LANGUAGE: str = "pl"
 
 
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model(path: str = DEFAULT_MODEL_PATH) -> vosk.Model:
-    """Load a VOSK model from *path*.  Raises FileNotFoundError if not found."""
-    vosk.SetLogLevel(-1)
-    if not os.path.isdir(path):
-        raise FileNotFoundError(f"VOSK model not found: {path}")
-    return vosk.Model(path)
+def load_model(
+    model_size: str = DEFAULT_WHISPER_MODEL,
+    language: str = DEFAULT_LANGUAGE,
+) -> WhisperModel:
+    """Load a faster-whisper model.
+
+    Downloads the model from HuggingFace Hub on first run (~145 MB for base),
+    then caches it at ~/.cache/huggingface/hub/.
+
+    Parameters
+    ----------
+    model_size:
+        Whisper model size: "tiny", "base", "small", "medium", "large-v3", …
+    language:
+        Language hint stored on the model object for use in transcribe().
+
+    Returns
+    -------
+    WhisperModel
+        A loaded faster-whisper model instance with a `language` attribute set.
+    """
+    model = WhisperModel(
+        model_size,
+        device="cpu",
+        compute_type="int8",  # fastest CPU inference
+    )
+    # Attach language preference so callers don't need to pass it separately
+    model.language = language  # type: ignore[attr-defined]
+    return model
 
 
 # ---------------------------------------------------------------------------
 # Transcription
 # ---------------------------------------------------------------------------
 
-def transcribe(model: vosk.Model, audio_data: np.ndarray) -> str:
-    """Transcribe *audio_data* (int16, mono, 16 kHz) using *model*.
+def transcribe(model: WhisperModel, audio_data: np.ndarray) -> str:
+    """Transcribe *audio_data* (int16, mono, 16 kHz) using Whisper.
 
+    Writes audio to a temporary WAV file, then feeds it to faster-whisper.
     Returns the recognised text, or an empty string if nothing was heard.
-    """
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio_data.tobytes())
-    buf.seek(0)
 
-    wf = wave.open(buf, "rb")
-    rec = vosk.KaldiRecognizer(model, wf.getframerate())
-    rec.SetWords(True)
-    while True:
-        data = wf.readframes(4000)
-        if not data:
-            break
-        rec.AcceptWaveform(data)
-    result = json.loads(rec.FinalResult())
-    return result.get("text", "").strip()
+    Parameters
+    ----------
+    model:
+        A WhisperModel loaded via load_model().  Should have a .language attr.
+    audio_data:
+        Flat int16 numpy array, mono, sampled at SAMPLE_RATE.
+
+    Returns
+    -------
+    str
+        Transcribed text, stripped of leading/trailing whitespace.
+    """
+    if len(audio_data) == 0:
+        return ""
+
+    language = getattr(model, "language", DEFAULT_LANGUAGE)
+
+    # Write audio to a temp WAV file — faster-whisper reads from file path
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = tmp.name
+        with wave.open(tmp, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)          # int16 = 2 bytes per sample
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_data.tobytes())
+
+    try:
+        segments, _info = model.transcribe(
+            tmp_path,
+            language=language,
+            beam_size=1,            # fastest decoding
+            vad_filter=True,        # skip silent parts automatically
+            vad_parameters={
+                "min_silence_duration_ms": 300,
+                "speech_pad_ms": 200,
+            },
+        )
+        text = " ".join(seg.text for seg in segments).strip()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    return text
 
 
 # ---------------------------------------------------------------------------

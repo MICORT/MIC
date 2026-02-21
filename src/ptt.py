@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Push-to-Talk Speech-to-Text (Polish / VOSK)
+Push-to-Talk Speech-to-Text (Polish / Whisper)
 
 Modes:
     terminal   - Hold key in terminal, text prints to stdout
@@ -11,6 +11,7 @@ Usage:
     ptt -m type            - Type mode: text goes to your active window (terminal, browser, etc.)
     ptt -k m               - Use 'm' key instead of space
     ptt -o file.txt        - Also append output to file
+    ptt --model small      - Use a different Whisper model size
 
 Controls:
     Hold key  = recording
@@ -20,23 +21,24 @@ Controls:
 
 import sys
 import os
-import io
-import json
-import wave
 import argparse
 import termios
 import tty
 import select
 import subprocess
 import time
+import tempfile
+import wave
+
 import numpy as np
 import sounddevice as sd
-import vosk
+from faster_whisper import WhisperModel
 
-MODEL_PATH = os.path.expanduser("~/stt-models/polish")
 SAMPLE_RATE = 16000
 CHANNELS = 1
 RELEASE_TIMEOUT = 0.25
+DEFAULT_MODEL = "base"
+DEFAULT_LANGUAGE = "pl"
 
 # ── colours ──────────────────────────────────────────────────────────
 RED = "\033[91m"
@@ -48,33 +50,43 @@ BOLD = "\033[1m"
 CLR = "\033[2K\r"
 
 
-def load_model():
-    vosk.SetLogLevel(-1)
-    sys.stderr.write(f"{CYAN}Loading model...{RESET}\n")
-    model = vosk.Model(MODEL_PATH)
+def load_model(model_size: str = DEFAULT_MODEL) -> WhisperModel:
+    sys.stderr.write(f"{CYAN}Loading Whisper model '{model_size}'...{RESET}\n")
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    model.language = DEFAULT_LANGUAGE  # type: ignore[attr-defined]
     sys.stderr.write(f"{GREEN}Model ready.{RESET}\n")
     return model
 
 
-def transcribe(model, audio_data: np.ndarray) -> str:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio_data.tobytes())
-    buf.seek(0)
+def transcribe(model: WhisperModel, audio_data: np.ndarray) -> str:
+    if len(audio_data) == 0:
+        return ""
+    language = getattr(model, "language", DEFAULT_LANGUAGE)
 
-    wf = wave.open(buf, "rb")
-    rec = vosk.KaldiRecognizer(model, wf.getframerate())
-    rec.SetWords(True)
-    while True:
-        data = wf.readframes(4000)
-        if len(data) == 0:
-            break
-        rec.AcceptWaveform(data)
-    result = json.loads(rec.FinalResult())
-    return result.get("text", "").strip()
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = tmp.name
+        with wave.open(tmp, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_data.tobytes())
+
+    try:
+        segments, _info = model.transcribe(
+            tmp_path,
+            language=language,
+            beam_size=1,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 200},
+        )
+        text = " ".join(seg.text for seg in segments).strip()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    return text
 
 
 def wtype_text(text: str):
@@ -133,7 +145,7 @@ def is_key_pressed(trigger_char: str, timeout: float = 0.05) -> bool:
 
 
 def run(args):
-    model = load_model()
+    model = load_model(args.model)
     recorder = Recorder()
     trigger = args.key
     trigger_label = "SPACE" if trigger == " " else trigger.upper()
@@ -145,7 +157,7 @@ def run(args):
     }
 
     sys.stderr.write(
-        f"\n{BOLD}{YELLOW}Push-to-Talk STT{RESET}  [{mode}: {mode_desc[mode]}]\n"
+        f"\n{BOLD}{YELLOW}Push-to-Talk STT (Whisper){RESET}  [{mode}: {mode_desc[mode]}]\n"
         f"Hold {BOLD}{trigger_label}{RESET} to record, release to transcribe.\n"
         f"Press {BOLD}Ctrl+C{RESET} to exit.\n\n"
     )
@@ -218,13 +230,15 @@ def run(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Push-to-Talk STT (Polish)")
+    parser = argparse.ArgumentParser(description="Push-to-Talk STT (Polish / Whisper)")
     parser.add_argument("-m", "--mode", choices=["terminal", "type"], default="terminal",
                         help="terminal = print text here; type = wtype into active window")
     parser.add_argument("-k", "--key", default=" ",
                         help="Trigger key (default: space)")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Append transcriptions to file")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help="Whisper model size: tiny, base, small, medium, large-v3 (default: base)")
     args = parser.parse_args()
     run(args)
 

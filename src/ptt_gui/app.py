@@ -4,7 +4,7 @@ ptt_gui.app — GTK4/Adwaita Push-to-Talk Speech-to-Text desktop application.
 Architecture
 ------------
 - GLib.idle_add / GLib.timeout_add are used to ferry results from worker
-  threads (audio recording, VOSK transcription) back to the GTK main loop.
+  threads (audio recording, Whisper transcription) back to the GTK main loop.
 - Recorder runs on a background thread via threading.Thread.
 - Transcription runs on a GLib.idle callback after recording stops so the
   UI updates immediately (spinner, status label) before the heavy work.
@@ -30,7 +30,8 @@ import numpy as np  # noqa: E402
 
 # Local core (same package)
 from ptt_gui.core import (  # noqa: E402
-    DEFAULT_MODEL_PATH,
+    DEFAULT_WHISPER_MODEL,
+    DEFAULT_LANGUAGE,
     Recorder,
     copy_to_clipboard_xdg,
     load_model,
@@ -328,12 +329,27 @@ class SettingsDialog(Adw.Dialog):
         content.set_margin_start(16)
         content.set_margin_end(16)
 
-        # --- Model path ---
-        model_group = Adw.PreferencesGroup(title="Model VOSK")
-        model_row = Adw.EntryRow(title="Ścieżka do modelu")
-        model_row.set_text(parent.model_path)
-        model_row.connect("changed", lambda r: setattr(parent, "_pending_model_path", r.get_text()))
-        model_group.add(model_row)
+        # --- Whisper model size ---
+        model_sizes = ["tiny", "base", "small", "medium", "large-v3"]
+        model_group = Adw.PreferencesGroup(title="Model Whisper")
+
+        self._model_row = Adw.ComboRow(title="Rozmiar modelu")
+        model_list = Gtk.StringList.new(model_sizes)
+        self._model_row.set_model(model_list)
+        current_idx = model_sizes.index(parent.whisper_model) if parent.whisper_model in model_sizes else 1
+        self._model_row.set_selected(current_idx)
+        self._model_row.connect("notify::selected", lambda r, _: setattr(
+            parent, "_pending_whisper_model", model_sizes[r.get_selected()]
+        ))
+        model_group.add(self._model_row)
+
+        model_hint = Gtk.Label(
+            label="tiny = najszybszy, large-v3 = najdokładniejszy.\n"
+                  "base (~145 MB) — dobry balans szybkości i jakości."
+        )
+        model_hint.set_wrap(True)
+        model_hint.add_css_class("hint-label")
+        model_group.add(model_hint)
         content.append(model_group)
 
         # --- Trigger key ---
@@ -389,9 +405,9 @@ class SettingsDialog(Adw.Dialog):
         self._parent.auto_type = (row.get_selected() == 1)
 
     def _on_apply(self, _btn) -> None:
-        pending = getattr(self._parent, "_pending_model_path", None)
+        pending = getattr(self._parent, "_pending_whisper_model", None)
         if pending:
-            self._parent.model_path = pending
+            self._parent.whisper_model = pending
         self._parent.reload_model()
         self.close()
 
@@ -406,7 +422,7 @@ def show_about(parent) -> None:
         application_icon="audio-input-microphone",
         version=VERSION,
         developer_name="PTT STT Project",
-        comments="Push-to-Talk mowa na tekst (Polski / VOSK)",
+        comments="Push-to-Talk mowa na tekst (Polski / Whisper)",
         license_type=Gtk.License.MIT_X11,
     )
     dialog.present(parent)
@@ -424,7 +440,7 @@ class PTTWindow(Adw.ApplicationWindow):
         self.set_resizable(True)
 
         # --- State ---
-        self.model_path: str = DEFAULT_MODEL_PATH
+        self.whisper_model: str = DEFAULT_WHISPER_MODEL
         self.auto_type: bool = True
         self.gain: float = 1.0
         self.min_duration: float = 0.3
@@ -645,7 +661,7 @@ class PTTWindow(Adw.ApplicationWindow):
 
     def _load_model_worker(self) -> None:
         try:
-            model = load_model(self.model_path)
+            model = load_model(self.whisper_model)
             GLib.idle_add(self._on_model_loaded, model)
         except Exception as exc:
             GLib.idle_add(self._on_model_error, str(exc))
