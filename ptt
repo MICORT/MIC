@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Push-to-Talk STT launcher
+VENV="$HOME/stt-env"
+SCRIPT="$HOME/projects/ptt/src/ptt.py"
+source "$VENV/bin/activate"
+exec python3 "$SCRIPT" "$@"

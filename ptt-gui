@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Push-to-Talk STT — GUI launcher
+# Activates the venv, adds src/ to PYTHONPATH and starts the GTK4 app.
+set -euo pipefail
+
+VENV="${HOME}/stt-env"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/src" && pwd)"
+
+# Activate venv (makes Python + installed packages available)
+source "${VENV}/bin/activate"
+
+# Make the ptt_gui package importable without a pip install
+export PYTHONPATH="${SRC_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
+exec python3 -m ptt_gui.app "$@"

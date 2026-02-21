@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Push-to-Talk STT
+Name[pl]=Push-to-Talk STT
+GenericName=Speech to Text
+GenericName[pl]=Mowa na tekst
+Comment=Polish speech recognition — push and hold to record
+Comment[pl]=Rozpoznawanie mowy po polsku — przytrzymaj i mów
+Exec=/home/tom/projects/ptt/ptt-gui
+Icon=pl.tomw.PushToTalk
+Terminal=false
+Categories=AudioVideo;Audio;Accessibility;Utility;
+Keywords=speech;stt;microphone;vosk;polish;ptt;
+StartupNotify=true
+StartupWMClass=pl.tomw.PushToTalk
